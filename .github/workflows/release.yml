@@ -1,0 +1,134 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # ───────────────────────────────────────────────
+  # Job 1: test — prove tests pass before anything else
+  # ───────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'          # cache layer #1 (CI-level dependency cache)
+
+      - run: npm ci
+      - run: npm test
+
+  # ───────────────────────────────────────────────
+  # Job 2: build — fail fast on typeScript errors,
+  # BEFORE paying for a slow Docker build
+  # ───────────────────────────────────────────────
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
+  # ───────────────────────────────────────────────
+  # Job 3: docker-release — build image w/ metadata,
+  # push both tags, capture the registry digest
+  # ───────────────────────────────────────────────
+  docker-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # required to push to GHCR
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha:     ${{ steps.meta.outputs.sha }}
+      date:    ${{ steps.meta.outputs.date }}
+      image:   ${{ steps.meta.outputs.image }}
+      digest:  ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history so git rev-parse works
+
+      - name: Compute release metadata
+        id: meta
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # GHCR requires lowercase image names; lowercase the owner explicitly
+          echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/company-api" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3   # needed for the gha cache backend
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT_SHA=${{ steps.meta.outputs.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ───────────────────────────────────────────────
+  # Job 4: release-artifact — write release.json, upload it
+  # ───────────────────────────────────────────────
+  release-artifact:
+    needs: docker-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build release.json
+        env:
+          VERSION: ${{ needs.docker-release.outputs.version }}
+          SHA:     ${{ needs.docker-release.outputs.sha }}
+          DATE:    ${{ needs.docker-release.outputs.date }}
+          IMAGE:   ${{ needs.docker-release.outputs.image }}
+          DIGEST:  ${{ needs.docker-release.outputs.digest }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          cat > release.json << JSON
+          {
+            "version": "$VERSION",
+            "commitSha": "$SHA",
+            "buildDate": "$DATE",
+            "imageName": "$IMAGE",
+            "imageTags": [
+              "$IMAGE:$VERSION",
+              "$IMAGE:$VERSION-$SHA"
+            ],
+            "imageDigest": "$DIGEST",
+            "runNumber": "$RUN_NUMBER"
+          }
+          JSON
+          echo "--- release.json ---"
+          cat release.json
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release.json

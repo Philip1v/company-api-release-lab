@@ -22,4 +22,4 @@ curl localhost:3000/health
 
 ## Stack
 
-NestJS 10 · Node 20 · TypeScript 5.
+NestJS 10 · Node 20 · Typescript 5.
